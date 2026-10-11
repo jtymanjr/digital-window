@@ -1,0 +1,534 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+</head>
+<body>
+<title>Digital Window</title>
+<style>
+  /* Layout: full-bleed WebGL window; one compact control dock top-left; modal sheets for start + calibration. Single dark look. */
+  :root {
+    --ink: #e9eef2;
+    --ink-dim: #9aa9b4;
+    --glass: rgba(14, 22, 28, 0.78);
+    --line: rgba(160, 190, 205, 0.22);
+    --accent: #7fd1c7;
+    --warn: #f0b36b;
+    --bg: #0b1014;
+    --f-ui: "Atkinson Hyperlegible", system-ui, sans-serif;
+    --f-num: "JetBrains Mono", ui-monospace, monospace;
+    color-scheme: dark;
+  }
+  [hidden] { display: none !important; }
+  html, body { height: 100%; }
+  body { background: var(--bg); color: var(--ink); font-family: var(--f-ui); overflow: hidden; margin: 0; }
+  #view { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+  .dock {
+    position: fixed; left: 12px; top: calc(12px + env(safe-area-inset-top, 0px));
+    background: var(--glass); border: 1px solid var(--line); border-radius: 10px;
+    padding: 10px; display: flex; flex-direction: column; gap: 8px; max-width: min(320px, calc(100vw - 24px));
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); z-index: 5;
+  }
+  .dock .row { display: flex; flex-wrap: wrap; gap: 6px; }
+  .status { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink-dim); flex: none; }
+  .dot.on { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+  .dot.warn { background: var(--warn); }
+  .readout { font-family: var(--f-num); font-size: 11px; color: var(--ink-dim); font-variant-numeric: tabular-nums; }
+  button {
+    font: inherit; font-size: 13px; color: var(--ink); background: rgba(255,255,255,0.06);
+    border: 1px solid var(--line); border-radius: 7px; padding: 6px 10px; cursor: pointer;
+  }
+  button:hover { background: rgba(255,255,255,0.12); }
+  button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button.primary { background: var(--accent); color: #062420; border-color: transparent; font-weight: 700; }
+  .ghost-toggle { position: fixed; right: 12px; top: calc(12px + env(safe-area-inset-top, 0px)); z-index: 5; opacity: 0.55; }
+  .sheet-wrap { position: fixed; inset: 0; display: grid; place-items: center; z-index: 10; background: rgba(5, 9, 12, 0.55); padding: 16px; }
+  .sheet {
+    background: var(--glass); border: 1px solid var(--line); border-radius: 14px; padding: 20px;
+    width: min(440px, 100%); max-height: calc(100% - 32px); overflow: auto; display: flex; flex-direction: column; gap: 14px;
+    backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+  }
+  .sheet h1 { font-size: 22px; margin: 0; text-wrap: balance; letter-spacing: 0.01em; }
+  .sheet h2 { font-size: 13px; margin: 0; text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-dim); }
+  .sheet p { margin: 0; line-height: 1.5; color: var(--ink-dim); font-size: 14px; }
+  .field { display: flex; flex-direction: column; gap: 6px; }
+  .field label { font-size: 13px; display: flex; justify-content: space-between; gap: 8px; }
+  .field label span { font-family: var(--f-num); color: var(--accent); font-variant-numeric: tabular-nums; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  .card-ref {
+    height: 54px; border: 2px dashed var(--accent); border-radius: 6px; display: grid; place-items: center;
+    font-size: 12px; color: var(--accent); max-width: 100%;
+  }
+  .note { font-size: 12px; color: var(--warn); line-height: 1.45; }
+  #pip { position: fixed; right: 12px; bottom: calc(12px + env(safe-area-inset-bottom, 0px)); width: 120px; border-radius: 8px; border: 1px solid var(--line); transform: scaleX(-1); z-index: 4; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=JetBrains+Mono:wght@400&display=swap">
+
+<canvas id="view"></canvas>
+<video id="cam" playsinline muted hidden></video>
+<canvas id="pip" hidden></canvas>
+
+<div class="dock" id="dock">
+  <div class="status"><i class="dot" id="dot"></i><b id="mode">Mouse mode</b></div>
+  <div class="readout" id="readout">eye x 0.0 · y 0.0 · z 55.0 cm</div>
+  <div class="row">
+    <button id="btnCam" type="button">Use camera</button>
+    <button id="btnScene" type="button">Scene: Box</button>
+    <button id="btnCal" type="button">Calibrate</button>
+  </div>
+  <div class="row">
+    <button id="btnFull" type="button">Fullscreen</button>
+    <button id="btnPip" type="button">Show camera</button>
+    <button id="btnHide" type="button">Hide panel</button>
+  </div>
+  <div class="note" id="note" hidden></div>
+</div>
+<button class="ghost-toggle" id="btnShow" type="button" hidden>Panel</button>
+
+<div class="sheet-wrap" id="intro">
+  <div class="sheet">
+    <h1>Digital Window</h1>
+    <p>Your screen becomes a pane of glass. The front camera follows your eyes and the scene is redrawn from exactly where you sit, so things behind the glass shift like real scenery and a few objects float in front of it.</p>
+    <p>Best with one eye closed (or a bit of distance), the browser in fullscreen, and a minute spent on Calibrate.</p>
+    <div class="row" style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="primary" id="introCam" type="button">Start with camera</button>
+      <button id="introMouse" type="button">Use mouse or touch</button>
+    </div>
+    <p class="note" id="introNote" hidden></p>
+  </div>
+</div>
+
+<div class="sheet-wrap" id="cal" hidden>
+  <div class="sheet">
+    <h1>Calibrate</h1>
+    <h2>1 · Screen size</h2>
+    <p>Hold a bank card against the screen and drag the slider until the dashed box is exactly as wide as the card (85.6 mm).</p>
+    <div class="card-ref" id="cardRef">85.6 mm</div>
+    <div class="field">
+      <label for="pxcm">Scale <span id="pxcmV"></span></label>
+      <input type="range" id="pxcm" min="20" max="90" step="0.1">
+    </div>
+    <div class="readout" id="screenSize"></div>
+    <h2>2 · Camera position</h2>
+    <div class="field">
+      <label for="camOff">Camera distance past the picture edge <span id="camOffV"></span></label>
+      <input type="range" id="camOff" min="0" max="8" step="0.1">
+    </div>
+    <p>About 1 cm on a fullscreen laptop. In a windowed browser add the height of the tabs and toolbar.</p>
+    <h2>3 · Distance</h2>
+    <p>Sit at a distance you know, enter it, and press Set. This tunes the camera's field of view so depth is right.</p>
+    <div class="field">
+      <label for="trueZ">I am this far from the screen <span id="trueZV"></span></label>
+      <input type="range" id="trueZ" min="20" max="120" step="1" value="50">
+    </div>
+    <div class="row" style="display:flex;gap:8px;flex-wrap:wrap">
+      <button id="setZ" type="button">Set distance</button>
+      <button id="flipX" type="button">Flip left/right</button>
+    </div>
+    <div class="field">
+      <label for="fov">Camera field of view <span id="fovV"></span></label>
+      <input type="range" id="fov" min="40" max="100" step="0.5">
+    </div>
+    <div class="field">
+      <label for="smooth">Smoothing <span id="smoothV"></span></label>
+      <input type="range" id="smooth" min="0" max="0.9" step="0.05">
+    </div>
+    <button class="primary" id="calDone" type="button">Done</button>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(() => {
+  // ---------- settings (cm units throughout) ----------
+  const isPhone = matchMedia('(pointer: coarse)').matches && Math.min(screen.width, screen.height) < 600;
+  const defaults = { pxPerCm: isPhone ? 61 : 50, camOff: isPhone ? 0.8 : 1.0, fov: isPhone ? 72 : 62, smooth: 0.5, flip: false };
+  let S = { ...defaults };
+  try { Object.assign(S, JSON.parse(localStorage.getItem('dw-settings') || '{}')); } catch (e) {}
+  const save = () => { try { localStorage.setItem('dw-settings', JSON.stringify(S)); } catch (e) {} };
+  const IPD = 6.3; // average adult interpupillary distance, cm
+
+  // ---------- renderer ----------
+  const canvas = document.getElementById('view');
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  const camera = new THREE.PerspectiveCamera();
+  camera.matrixAutoUpdate = true;
+  let W = 30, H = 20; // physical size of the drawing area, cm
+
+  const eye = new THREE.Vector3(0, 0, 55);     // smoothed
+  const target = new THREE.Vector3(0, 0, 55);  // raw
+
+  function resize() {
+    renderer.setSize(innerWidth, innerHeight, false);
+    W = innerWidth / S.pxPerCm; H = innerHeight / S.pxPerCm;
+    buildScene();
+    updateCalText();
+  }
+
+  function updateProjection() {
+    const n = 0.5, f = 30000;
+    const ez = Math.max(eye.z, 3);
+    const k = n / ez;
+    const l = (-W / 2 - eye.x) * k, r = (W / 2 - eye.x) * k;
+    const b = (-H / 2 - eye.y) * k, t = (H / 2 - eye.y) * k;
+    camera.position.set(eye.x, eye.y, ez);
+    camera.quaternion.identity();
+    camera.updateMatrixWorld();
+    camera.projectionMatrix.makePerspective(l, r, t, b, n, f);
+    camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
+  }
+
+  // ---------- scenes ----------
+  let scene = new THREE.Scene();
+  let sceneName = 'box';
+  let animated = [];
+  let rng;
+  const mulberry = (a) => () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+
+  function gridPlane(w, h, step, color, bg) {
+    const g = new THREE.Group();
+    const plane = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshLambertMaterial({ color: bg }));
+    g.add(plane);
+    const pts = [];
+    for (let x = -w / 2; x <= w / 2 + 1e-6; x += step) pts.push(x, -h / 2, 0.02, x, h / 2, 0.02);
+    for (let y = -h / 2; y <= h / 2 + 1e-6; y += step) pts.push(-w / 2, y, 0.02, w / 2, y, 0.02);
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+    g.add(new THREE.LineSegments(geo, new THREE.LineBasicMaterial({ color })));
+    return g;
+  }
+
+  function targetTexture() {
+    const c = document.createElement('canvas'); c.width = c.height = 128;
+    const x = c.getContext('2d');
+    const rings = ['#e8463a', '#f4efe6', '#e8463a', '#f4efe6', '#e8463a'];
+    rings.forEach((col, i) => { x.fillStyle = col; x.beginPath(); x.arc(64, 64, 62 - i * 12.5, 0, Math.PI * 2); x.fill(); });
+    return new THREE.CanvasTexture(c);
+  }
+  const tgtTex = targetTexture();
+
+  function buildBox() {
+    const s = new THREE.Scene();
+    s.background = new THREE.Color(0x05080a);
+    s.add(new THREE.HemisphereLight(0xdfefff, 0x223040, 0.9));
+    const sun = new THREE.DirectionalLight(0xffffff, 0.6); sun.position.set(20, 40, 60); s.add(sun);
+    const D = Math.max(W, H) * 1.6;
+    const step = Math.max(W, H) / 12;
+    const lineCol = 0x5fd0c2, bg = 0x0e1a1f;
+    const back = gridPlane(W, H, step, lineCol, bg); back.position.z = -D; s.add(back);
+    const floor = gridPlane(W, D, step, lineCol, bg); floor.rotation.x = -Math.PI / 2; floor.position.set(0, -H / 2, -D / 2); s.add(floor);
+    const ceil = gridPlane(W, D, step, lineCol, bg); ceil.rotation.x = Math.PI / 2; ceil.position.set(0, H / 2, -D / 2); s.add(ceil);
+    const left = gridPlane(D, H, step, lineCol, bg); left.rotation.y = Math.PI / 2; left.position.set(-W / 2, 0, -D / 2); s.add(left);
+    const right = gridPlane(D, H, step, lineCol, bg); right.rotation.y = -Math.PI / 2; right.position.set(W / 2, 0, -D / 2); s.add(right);
+
+    rng = mulberry(7);
+    const r0 = Math.min(W, H) * 0.06;
+    const lineMat = new THREE.LineBasicMaterial({ color: 0xbfcad0 });
+    const addTarget = (x, y, z, r) => {
+      const disc = new THREE.Mesh(new THREE.CircleGeometry(r, 48), new THREE.MeshBasicMaterial({ map: tgtTex, side: THREE.DoubleSide }));
+      disc.position.set(x, y, z); s.add(disc);
+      const geo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(x, y, z - 0.05), new THREE.Vector3(x, y, -D)]);
+      s.add(new THREE.Line(geo, lineMat));
+    };
+    // behind the glass
+    for (let i = 0; i < 9; i++) {
+      const z = -D * (0.12 + 0.8 * rng());
+      addTarget((rng() - 0.5) * W * 0.8, (rng() - 0.5) * H * 0.75, z, r0 * (0.8 + rng() * 0.6));
+    }
+    // poking out in front of the glass (kept near the centre so the frame doesn't cut them)
+    addTarget(-W * 0.12, H * 0.05, Math.min(W, H) * 0.25, r0 * 0.75);
+    addTarget(W * 0.15, -H * 0.12, Math.min(W, H) * 0.4, r0 * 0.6);
+    // a slow spinning cube mid-depth for motion
+    const cube = new THREE.Mesh(new THREE.BoxGeometry(r0 * 2.2, r0 * 2.2, r0 * 2.2), new THREE.MeshLambertMaterial({ color: 0xf0b36b }));
+    cube.position.set(W * 0.25, H * 0.2, -D * 0.45); s.add(cube);
+    animated.push((t) => { cube.rotation.x = t * 0.4; cube.rotation.y = t * 0.6; });
+    return s;
+  }
+
+  function buildValley() {
+    const s = new THREE.Scene();
+    const sky = new THREE.Color(0xa9cde0);
+    s.background = sky;
+    s.fog = new THREE.Fog(sky, 5000, 28000);
+    s.add(new THREE.HemisphereLight(0xeaf6ff, 0x4a5a3a, 0.85));
+    const sun = new THREE.DirectionalLight(0xfff1d6, 0.9); sun.position.set(-3000, 4000, 2000); s.add(sun);
+    rng = mulberry(11);
+    const groundY = -H / 2 - 260; // an upstairs window, ~2.6 m above the ground outside
+
+    // rolling ground
+    const g = new THREE.PlaneGeometry(40000, 40000, 120, 120);
+    g.rotateX(-Math.PI / 2);
+    const p = g.attributes.position;
+    for (let i = 0; i < p.count; i++) {
+      const x = p.getX(i), z = p.getZ(i);
+      const d = Math.hypot(x, z);
+      const h = Math.sin(x * 0.0011) * 50 + Math.cos(z * 0.0009 + 1) * 70 + Math.sin((x + z) * 0.0004) * 110;
+      p.setY(i, groundY + h * Math.min(1, d / 1500));
+    }
+    g.computeVertexNormals();
+    s.add(new THREE.Mesh(g, new THREE.MeshPhongMaterial({ color: 0x6f8f4e, flatShading: true, shininess: 0 })));
+    const groundAt = (x, z) => { const d = Math.hypot(x, z); return groundY + (Math.sin(x * 0.0011) * 50 + Math.cos(z * 0.0009 + 1) * 70 + Math.sin((x + z) * 0.0004) * 110) * Math.min(1, d / 1500); };
+
+    // lake
+    const lake = new THREE.Mesh(new THREE.CircleGeometry(900, 48), new THREE.MeshLambertMaterial({ color: 0x5f93ab }));
+    lake.rotation.x = -Math.PI / 2; lake.position.set(600, groundAt(600, -2600) + 25, -2600); lake.scale.set(1.6, 1, 1); s.add(lake);
+
+    // mountains
+    for (let i = 0; i < 18; i++) {
+      const z = -11000 - rng() * 8000, x = (rng() - 0.5) * 26000, h = 1600 + rng() * 2000, r = h * (1.1 + rng() * 0.6);
+      const m = new THREE.Mesh(new THREE.ConeGeometry(r, h, 7), new THREE.MeshPhongMaterial({ color: 0x6a7480, flatShading: true, shininess: 0 }));
+      m.position.set(x, groundY + h / 2 - 200, z); m.rotation.y = rng() * 3; s.add(m);
+      const capH = h * 0.28;
+      const cap = new THREE.Mesh(new THREE.ConeGeometry(r * 0.28 * 1.02, capH, 7), new THREE.MeshPhongMaterial({ color: 0xf3f6f8, flatShading: true, shininess: 0 }));
+      cap.position.set(x, groundY + h - 200 - capH / 2 + 1, z); cap.rotation.y = m.rotation.y; s.add(cap);
+    }
+
+    // trees at many depths
+    const trunkMat = new THREE.MeshLambertMaterial({ color: 0x5a4030 });
+    const leafMats = [0x2f5d3a, 0x3b6e41, 0x26503a].map(c => new THREE.MeshPhongMaterial({ color: c, flatShading: true, shininess: 0 }));
+    for (let i = 0; i < 320; i++) {
+      const z = -1400 - Math.pow(rng(), 1.3) * 7000;
+      const spread = 800 + (-z) * 2;
+      const x = (rng() - 0.5) * spread;
+      if (Math.abs(x) < -z * 0.26) continue; // keep a clear view down the valley
+      if (Math.abs(x - 600) < 1400 && Math.abs(z + 2600) < 900) continue; // keep the lake clear
+      const h = 250 + rng() * 450; if (z + h * 0.3 > -300) continue;
+      const y = groundAt(x, z);
+      const tree = new THREE.Group();
+      const trunk = new THREE.Mesh(new THREE.CylinderGeometry(h * 0.03, h * 0.04, h * 0.3, 6), trunkMat);
+      trunk.position.y = h * 0.15; tree.add(trunk);
+      for (let k = 0; k < 3; k++) {
+        const cone = new THREE.Mesh(new THREE.ConeGeometry(h * (0.28 - k * 0.06), h * 0.42, 7), leafMats[(i + k) % 3]);
+        cone.position.y = h * (0.38 + k * 0.2); tree.add(cone);
+      }
+      tree.position.set(x, y, z); s.add(tree);
+    }
+
+    // window mullions right at the glass plane
+    const frameMat = new THREE.MeshLambertMaterial({ color: 0xece6da });
+    const bar = Math.min(W, H) * 0.018;
+    const v = new THREE.Mesh(new THREE.BoxGeometry(bar, H, bar), frameMat); v.position.set(0, 0, -bar); s.add(v);
+    const hz = new THREE.Mesh(new THREE.BoxGeometry(W, bar, bar), frameMat); hz.position.set(0, H * 0.12, -bar); s.add(hz);
+
+    // seeds drifting in the air, some on our side of the glass
+    const seedGeo = new THREE.SphereGeometry(Math.min(W, H) * 0.006, 8, 6);
+    const seedMat = new THREE.MeshBasicMaterial({ color: 0xfffbea });
+    const seeds = [];
+    for (let i = 0; i < 45; i++) {
+      const m = new THREE.Mesh(seedGeo, seedMat);
+      m.userData = { x: (rng() - 0.5) * W * 1.2, y: (rng() - 0.5) * H, z: -Math.min(W, H) * 3 * rng() + Math.min(W, H) * 0.35 * rng(), ph: rng() * 6.28, sp: 0.4 + rng() * 0.6 };
+      s.add(m); seeds.push(m);
+    }
+    animated.push((t) => {
+      for (const m of seeds) {
+        const u = m.userData;
+        let x = u.x + ((t * u.sp * 1.5 + 1000) % (W * 1.4)) - W * 0.7;
+        if (x > W * 0.7) x -= W * 1.4;
+        m.position.set(x, u.y + Math.sin(t * u.sp + u.ph) * H * 0.05, u.z);
+      }
+    });
+    return s;
+  }
+
+  function buildScene() {
+    animated = [];
+    scene.traverse(o => { if (o.geometry) o.geometry.dispose(); });
+    scene = sceneName === 'box' ? buildBox() : buildValley();
+  }
+
+  // ---------- pointer fallback ----------
+  let tracking = false;
+  function onPointer(e) {
+    if (tracking) return;
+    const nx = e.clientX / innerWidth - 0.5, ny = e.clientY / innerHeight - 0.5;
+    target.set(nx * W * 1.4, -ny * H * 1.4, 55);
+  }
+  canvas.addEventListener('pointermove', onPointer);
+  canvas.addEventListener('pointerdown', onPointer);
+
+  // ---------- head tracking ----------
+  const video = document.getElementById('cam');
+  const pip = document.getElementById('pip');
+  const pipCtx = pip.getContext('2d');
+  let landmarker = null, lastVideoTime = -1, lastIpdPx = 0, lostFrames = 0;
+  const $ = (id) => document.getElementById(id);
+
+  function setMode(text, state) {
+    $('mode').textContent = text;
+    $('dot').className = 'dot' + (state === 'on' ? ' on' : state === 'warn' ? ' warn' : '');
+  }
+  function showNote(msg) { $('note').textContent = msg; $('note').hidden = !msg; }
+
+  async function startCamera() {
+    if (tracking || landmarker) return true;
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      return fail('This browser does not offer camera access on this page. Open the page over https (or as a local file in Chrome) to use head tracking.');
+    }
+    setMode('Starting camera…', 'warn');
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+    } catch (e) {
+      return fail('Camera was blocked (' + (e.name || 'error') + '). Allow camera access for this page, or keep using the mouse.');
+    }
+    video.srcObject = stream;
+    await video.play().catch(() => {});
+    setMode('Loading face tracker…', 'warn');
+    try {
+      const base = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
+      const vision = await import(base + '/vision_bundle.mjs');
+      const files = await vision.FilesetResolver.forVisionTasks(base + '/wasm');
+      const opts = (delegate) => ({
+        baseOptions: { modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task', delegate },
+        runningMode: 'VIDEO', numFaces: 1
+      });
+      try { landmarker = await vision.FaceLandmarker.createFromOptions(files, opts('GPU')); }
+      catch (e) { landmarker = await vision.FaceLandmarker.createFromOptions(files, opts('CPU')); }
+    } catch (e) {
+      stream.getTracks().forEach(t => t.stop());
+      return fail('The face tracker could not load (' + (e.message || e) + '). Check the network and reload.');
+    }
+    tracking = true;
+    setMode('Tracking your head', 'on');
+    showNote('');
+    $('btnCam').textContent = 'Camera on';
+    return true;
+  }
+  function fail(msg) {
+    setMode('Mouse mode', 'warn');
+    showNote(msg);
+    $('introNote').textContent = msg; $('introNote').hidden = false;
+    return false;
+  }
+
+  // where the camera sits relative to the centre of the picture, in cm
+  function cameraOrigin() {
+    const a = (screen.orientation && screen.orientation.angle) || (typeof window.orientation === 'number' ? window.orientation : 0);
+    const ang = ((a % 360) + 360) % 360;
+    if (isPhone && ang === 90) return { x: -W / 2 - S.camOff, y: 0 };
+    if (isPhone && ang === 270) return { x: W / 2 + S.camOff, y: 0 };
+    return { x: 0, y: H / 2 + S.camOff };
+  }
+
+  function focalPx() {
+    const long = Math.max(video.videoWidth, video.videoHeight);
+    return (long / 2) / Math.tan((S.fov * Math.PI / 180) / 2);
+  }
+
+  function trackFrame() {
+    if (!landmarker || video.readyState < 2 || video.currentTime === lastVideoTime) return;
+    lastVideoTime = video.currentTime;
+    const res = landmarker.detectForVideo(video, performance.now());
+    const vw = video.videoWidth, vh = video.videoHeight;
+    if (!res.faceLandmarks || !res.faceLandmarks.length) {
+      if (++lostFrames === 15) setMode('Looking for your face…', 'warn');
+      return;
+    }
+    if (lostFrames >= 15) setMode('Tracking your head', 'on');
+    lostFrames = 0;
+    const lm = res.faceLandmarks[0];
+    const L = lm[468], R = lm[473]; // iris centres
+    const lx = L.x * vw, ly = L.y * vh, rx = R.x * vw, ry = R.y * vh;
+    const ipdPx = Math.hypot(lx - rx, ly - ry);
+    lastIpdPx = ipdPx;
+    const f = focalPx();
+    const z = f * IPD / ipdPx;
+    const cx = (lx + rx) / 2 - vw / 2, cy = (ly + ry) / 2 - vh / 2;
+    const o = cameraOrigin();
+    let x = -cx / f * z; if (S.flip) x = -x;
+    const y = -cy / f * z;
+    target.set(o.x + x, o.y + y, z);
+    if (!pip.hidden) drawPip(lm);
+  }
+
+  function drawPip(lm) {
+    pip.width = 240; pip.height = Math.round(240 * video.videoHeight / video.videoWidth);
+    pipCtx.drawImage(video, 0, 0, pip.width, pip.height);
+    pipCtx.fillStyle = '#7fd1c7';
+    for (const i of [468, 473]) { pipCtx.beginPath(); pipCtx.arc(lm[i].x * pip.width, lm[i].y * pip.height, 4, 0, 7); pipCtx.fill(); }
+  }
+
+  // ---------- loop ----------
+  const clock = new THREE.Clock();
+  let readoutT = 0;
+  function frame() {
+    requestAnimationFrame(frame);
+    if (tracking) trackFrame();
+    const a = 1 - S.smooth * 0.9;
+    eye.lerp(target, tracking ? a : 0.15);
+    const t = clock.getElapsedTime();
+    for (const fn of animated) fn(t);
+    updateProjection();
+    renderer.render(scene, camera);
+    if (t - readoutT > 0.15) {
+      readoutT = t;
+      $('readout').textContent = `eye x ${eye.x.toFixed(1)} · y ${eye.y.toFixed(1)} · z ${eye.z.toFixed(1)} cm · picture ${W.toFixed(1)}×${H.toFixed(1)} cm`;
+    }
+  }
+
+  // ---------- UI ----------
+  const intro = $('intro'), cal = $('cal');
+  $('introCam').onclick = async () => { const ok = await startCamera(); if (ok) intro.hidden = true; };
+  $('introMouse').onclick = () => { intro.hidden = true; };
+  $('btnCam').onclick = () => startCamera();
+  $('btnScene').onclick = () => {
+    sceneName = sceneName === 'box' ? 'valley' : 'box';
+    $('btnScene').textContent = 'Scene: ' + (sceneName === 'box' ? 'Box' : 'Valley');
+    buildScene();
+  };
+  $('btnFull').onclick = () => {
+    const el = document.documentElement;
+    const req = el.requestFullscreen || el.webkitRequestFullscreen;
+    if (req) Promise.resolve(req.call(el)).catch(() => showNote('Fullscreen is not available here.'));
+    else showNote('Fullscreen is not available here. On iPhone, use Share › Add to Home Screen for an edge-to-edge view.');
+  };
+  $('btnPip').onclick = () => { pip.hidden = !pip.hidden; $('btnPip').textContent = pip.hidden ? 'Show camera' : 'Hide camera'; };
+  $('btnHide').onclick = () => { $('dock').hidden = true; $('btnShow').hidden = false; };
+  $('btnShow').onclick = () => { $('dock').hidden = false; $('btnShow').hidden = true; };
+  $('btnCal').onclick = () => { syncCal(); cal.hidden = false; };
+  $('calDone').onclick = () => { cal.hidden = true; save(); resize(); };
+
+  function updateCalText() {
+    $('screenSize').textContent = `Picture area: ${W.toFixed(1)} × ${H.toFixed(1)} cm (${(Math.hypot(W, H) / 2.54).toFixed(1)}″ diagonal)`;
+  }
+  function syncCal() {
+    $('pxcm').value = S.pxPerCm; $('camOff').value = S.camOff; $('fov').value = S.fov; $('smooth').value = S.smooth;
+    refreshCal();
+  }
+  function refreshCal() {
+    $('cardRef').style.width = (8.56 * S.pxPerCm) + 'px';
+    $('pxcmV').textContent = S.pxPerCm.toFixed(1) + ' px/cm';
+    $('camOffV').textContent = S.camOff.toFixed(1) + ' cm';
+    $('fovV').textContent = S.fov.toFixed(1) + '°';
+    $('smoothV').textContent = Math.round(S.smooth * 100) + '%';
+    $('trueZV').textContent = $('trueZ').value + ' cm';
+    W = innerWidth / S.pxPerCm; H = innerHeight / S.pxPerCm; updateCalText();
+  }
+  $('pxcm').oninput = (e) => { S.pxPerCm = +e.target.value; refreshCal(); };
+  $('camOff').oninput = (e) => { S.camOff = +e.target.value; refreshCal(); };
+  $('fov').oninput = (e) => { S.fov = +e.target.value; refreshCal(); };
+  $('smooth').oninput = (e) => { S.smooth = +e.target.value; refreshCal(); };
+  $('trueZ').oninput = refreshCal;
+  $('setZ').onclick = () => {
+    if (!tracking || !lastIpdPx) { showNote('Start the camera first, then set the distance.'); return; }
+    const z = +$('trueZ').value;
+    const f = z * lastIpdPx / IPD;
+    const long = Math.max(video.videoWidth, video.videoHeight);
+    S.fov = Math.max(30, Math.min(120, 2 * Math.atan((long / 2) / f) * 180 / Math.PI));
+    syncCal();
+  };
+  $('flipX').onclick = () => { S.flip = !S.flip; save(); };
+
+  addEventListener('resize', resize);
+  if (screen.orientation) screen.orientation.addEventListener('change', resize);
+  resize();
+  frame();
+})();
+</script>
+
+</body>
+</html>
